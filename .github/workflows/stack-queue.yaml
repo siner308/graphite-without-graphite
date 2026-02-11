@@ -1,0 +1,649 @@
+name: Stack Queue
+
+on:
+  pull_request:
+    types: [opened, edited]
+  issue_comment:
+    types: [created]
+
+concurrency:
+  group: stack-queue
+  cancel-in-progress: false
+
+jobs:
+  # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  # PR 오픈 시 사용 가이드 코멘트 자동 게시
+  # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  guide:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+    steps:
+      - name: Post or update stack guide
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const pr = context.payload.pull_request;
+            const pattern = /<!-- stack-rebase:([\s\S]*?) -->/;
+            const marker = '<!-- stack-guide -->';
+
+            let children = null;
+            const bodyMatch = (pr.body || '').match(pattern);
+            if (bodyMatch) {
+              try { children = JSON.parse(bodyMatch[1]).children; } catch {}
+            }
+
+            const { data: comments } = await github.rest.issues.listComments({
+              owner, repo, issue_number: pr.number,
+            });
+            const existing = comments.find(c =>
+              c.body.includes(marker) && c.user.type === 'Bot'
+            );
+
+            if (!children?.length) {
+              if (existing) {
+                await github.rest.issues.deleteComment({
+                  owner, repo, comment_id: existing.id,
+                });
+              }
+              return;
+            }
+
+            const stack = [`#${pr.number} (\`${pr.head.ref}\`)`]
+              .concat(children.map(c => `#${c.pr} (\`${c.branch}\`)`))
+              .join(' → ');
+
+            const guide = [
+              marker,
+              '### Stack Queue',
+              '',
+              '| Command | Description |',
+              '|---------|-------------|',
+              '| `stack merge` | Merge this PR, restack children |',
+              '| `stack merge-all` | Merge entire stack (requires all approved) |',
+              '| `stack merge-all --force` | Merge entire stack (skip approval check) |',
+              '| `stack restack` | Restack children without merging |',
+              '',
+              `**Stack:** ${stack}`,
+            ].join('\n');
+
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner, repo, comment_id: existing.id, body: guide,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner, repo, issue_number: pr.number, body: guide,
+              });
+            }
+
+  # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  # stack 커맨드 처리
+  # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  command:
+    if: >-
+      github.event_name == 'issue_comment'
+      && github.event.issue.pull_request
+      && startsWith(github.event.comment.body, 'stack ')
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+      checks: read
+    steps:
+      - name: Generate GitHub App token
+        id: app-token
+        continue-on-error: true
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ vars.STACK_APP_ID }}
+          private-key: ${{ secrets.STACK_APP_PRIVATE_KEY }}
+
+      - name: Parse command
+        id: cmd
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const body = context.payload.comment.body.trim();
+            const match = body.match(
+              /^stack\s+(merge-all|merge|restack|help)\b(.*)$/i
+            );
+            if (!match) {
+              core.setOutput('valid', 'false');
+              return;
+            }
+            core.setOutput('valid', 'true');
+            core.setOutput('command', match[1].toLowerCase());
+            core.setOutput('force', String(match[2].includes('--force')));
+
+      - name: React eyes
+        if: steps.cmd.outputs.valid == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.reactions.createForIssueComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              comment_id: context.payload.comment.id,
+              content: 'eyes',
+            });
+
+      - name: Checkout
+        if: >-
+          steps.cmd.outputs.valid == 'true'
+          && steps.cmd.outputs.command != 'help'
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: >-
+            ${{ steps.app-token.outputs.token
+              || secrets.STACK_BOT_TOKEN
+              || github.token }}
+
+      - name: Configure git
+        if: >-
+          steps.cmd.outputs.valid == 'true'
+          && steps.cmd.outputs.command != 'help'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Execute stack command
+        if: steps.cmd.outputs.valid == 'true'
+        id: run
+        env:
+          COMMAND: ${{ steps.cmd.outputs.command }}
+          FORCE: ${{ steps.cmd.outputs.force }}
+        uses: actions/github-script@v7
+        with:
+          github-token: >-
+            ${{ steps.app-token.outputs.token
+              || secrets.STACK_BOT_TOKEN
+              || github.token }}
+          script: |
+            const { owner, repo } = context.repo;
+            const prNumber = context.payload.issue.number;
+            const command = process.env.COMMAND;
+            const force = process.env.FORCE === 'true';
+
+            // ════════════════════════════════════════
+            // Helpers
+            // ════════════════════════════════════════
+
+            async function getStackMeta(prNum) {
+              const { data: pr } = await github.rest.pulls.get({
+                owner, repo, pull_number: prNum,
+              });
+              const pat = /<!-- stack-rebase:([\s\S]*?) -->/;
+
+              const m = (pr.body || '').match(pat);
+              if (m) {
+                try { return { meta: JSON.parse(m[1]), pr }; } catch {}
+              }
+
+              const { data: comments } = await github.rest.issues.listComments({
+                owner, repo, issue_number: prNum,
+              });
+              for (const c of comments) {
+                const cm = (c.body || '').match(pat);
+                if (cm) {
+                  try { return { meta: JSON.parse(cm[1]), pr }; } catch {}
+                }
+              }
+              return { meta: null, pr };
+            }
+
+            async function isApproved(prNum) {
+              const { data: reviews } = await github.rest.pulls.listReviews({
+                owner, repo, pull_number: prNum,
+              });
+              const latest = {};
+              for (const r of reviews) {
+                if (!r.user) continue;
+                const u = r.user.login;
+                if (
+                  !latest[u] ||
+                  new Date(r.submitted_at) > new Date(latest[u].submitted_at)
+                ) {
+                  latest[u] = r;
+                }
+              }
+              const vals = Object.values(latest);
+              return (
+                vals.some(r => r.state === 'APPROVED') &&
+                !vals.some(r => r.state === 'CHANGES_REQUESTED')
+              );
+            }
+
+            async function tryMerge(prNum, method = 'squash', retries = 0) {
+              for (let i = 0; i <= retries; i++) {
+                try {
+                  const { data } = await github.rest.pulls.merge({
+                    owner,
+                    repo,
+                    pull_number: prNum,
+                    merge_method: method,
+                  });
+                  return { ok: true, sha: data.sha };
+                } catch (e) {
+                  const msg = e.message || '';
+                  const retryable =
+                    /required status|pending|expected|head branch was modified/i.test(
+                      msg
+                    );
+                  if (retryable && i < retries) {
+                    console.log(
+                      `  #${prNum} attempt ${i + 1}: ${msg}. Retry in 30s...`
+                    );
+                    await new Promise(r => setTimeout(r, 30000));
+                    continue;
+                  }
+                  return { ok: false, error: msg };
+                }
+              }
+            }
+
+            async function doRestack(branch, onto, skip) {
+              try {
+                await exec.exec('git', ['checkout', onto, '--detach'], {
+                  silent: true,
+                });
+                await exec.exec('git', [
+                  'rebase', '--onto', onto, skip, branch,
+                ]);
+                await exec.exec('git', [
+                  'push', '--force-with-lease', 'origin', branch,
+                ]);
+                return { ok: true };
+              } catch (e) {
+                try {
+                  await exec.exec('git', ['rebase', '--abort']);
+                } catch {}
+                return { ok: false, error: String(e) };
+              }
+            }
+
+            async function post(prNum, body) {
+              await github.rest.issues.createComment({
+                owner, repo, issue_number: prNum, body,
+              });
+            }
+
+            async function getOldTip(branch) {
+              try {
+                const { stdout } = await exec.getExecOutput('git', [
+                  'rev-parse', `origin/${branch}`,
+                ]);
+                return stdout.trim();
+              } catch {
+                return null;
+              }
+            }
+
+            async function ensureLocalBranch(branch) {
+              await exec
+                .exec('git', ['branch', branch, `origin/${branch}`])
+                .catch(() => {});
+            }
+
+            // ════════════════════════════════════════
+            // Restack 공통 로직
+            // ════════════════════════════════════════
+
+            async function restackChildren(children, baseBranch, initialSkip) {
+              await exec.exec('git', ['fetch', 'origin']);
+
+              const results = [];
+              let prevBase = `origin/${baseBranch}`;
+              let prevSkip = initialSkip;
+              let failed = false;
+
+              for (const child of children) {
+                const oldTip = await getOldTip(child.branch);
+
+                if (!oldTip) {
+                  results.push({ ...child, status: 'missing' });
+                  failed = true;
+                  continue;
+                }
+                if (failed) {
+                  results.push({ ...child, status: 'skipped', oldTip });
+                  continue;
+                }
+
+                await ensureLocalBranch(child.branch);
+                const r = await doRestack(child.branch, prevBase, prevSkip);
+
+                if (r.ok) {
+                  results.push({ ...child, status: 'restacked', oldTip });
+                  prevSkip = oldTip;
+                  prevBase = child.branch;
+                } else {
+                  results.push({
+                    ...child, status: 'conflict', oldTip, error: r.error,
+                  });
+                  failed = true;
+                }
+              }
+
+              const first = results.find(r => r.status === 'restacked');
+              if (first) {
+                await github.rest.pulls
+                  .update({
+                    owner, repo, pull_number: first.pr, base: baseBranch,
+                  })
+                  .catch(() => {});
+              }
+
+              return results;
+            }
+
+            function formatResults(results, baseBranch, skipSha) {
+              const label = {
+                restacked: 'Restacked',
+                merged: 'Merged',
+                conflict: 'Conflict',
+                missing: 'Branch not found',
+                skipped: 'Skipped (blocked)',
+                merge_failed: 'Merge failed',
+              };
+              const rows = results.map(
+                r =>
+                  `| \`${r.branch}\` | #${r.pr} | ${label[r.status] || r.status} |`
+              );
+
+              const firstFail = results.findIndex(
+                r => !['restacked', 'merged'].includes(r.status)
+              );
+              let manual = '';
+              if (firstFail >= 0) {
+                const cmds = ['git fetch origin', ''];
+                for (let i = firstFail; i < results.length; i++) {
+                  const r = results[i];
+                  if (!r.oldTip) continue;
+                  const onto =
+                    i === 0
+                      ? `origin/${baseBranch}`
+                      : results[i - 1].branch;
+                  const skip =
+                    i === 0
+                      ? skipSha.substring(0, 8)
+                      : (results[i - 1].oldTip || skipSha).substring(0, 8);
+                  cmds.push(`# ${r.branch} (PR #${r.pr})`);
+                  cmds.push(
+                    `git rebase --onto ${onto} ${skip} ${r.branch}`
+                  );
+                  cmds.push('# resolve conflicts if any, then:');
+                  cmds.push(
+                    `git push --force-with-lease origin ${r.branch}`
+                  );
+                  cmds.push('');
+                }
+                manual = [
+                  '',
+                  '<details><summary>Manual restack commands</summary>',
+                  '',
+                  '```bash',
+                  ...cmds,
+                  '```',
+                  '</details>',
+                ].join('\n');
+              }
+
+              return [
+                '| Branch | PR | Status |',
+                '|--------|-----|--------|',
+                ...rows,
+                manual,
+              ].join('\n');
+            }
+
+            // ════════════════════════════════════════
+            // Command Dispatch
+            // ════════════════════════════════════════
+
+            const { meta, pr } = await getStackMeta(prNumber);
+            const baseBranch = pr.base.ref;
+            const children = meta?.children || [];
+            const mergeMethod = meta?.merge_method || 'squash';
+
+            // ── help ──
+            if (command === 'help') {
+              const stack = children.length
+                ? [`#${prNumber} (\`${pr.head.ref}\`)`]
+                    .concat(
+                      children.map(c => `#${c.pr} (\`${c.branch}\`)`)
+                    )
+                    .join(' → ')
+                : '_No stack metadata found._';
+
+              await post(prNumber, [
+                '### Stack Queue Commands',
+                '',
+                '| Command | Description |',
+                '|---------|-------------|',
+                '| `stack merge` | Merge this PR, restack children |',
+                '| `stack merge-all` | Merge entire stack (requires approval) |',
+                '| `stack merge-all --force` | Skip approval check |',
+                '| `stack restack` | Restack children only |',
+                '',
+                `**Stack:** ${stack}`,
+              ].join('\n'));
+              return;
+            }
+
+            // ── restack ──
+            if (command === 'restack') {
+              if (!children.length) {
+                await post(prNumber, 'No children to restack.');
+                return;
+              }
+
+              const results = await restackChildren(
+                children, baseBranch, pr.head.sha
+              );
+              const ok = results.every(r => r.status === 'restacked');
+
+              await post(prNumber, [
+                ok ? '### Restack: Complete' : '### Restack: Action Needed',
+                '',
+                formatResults(results, baseBranch, pr.head.sha),
+              ].join('\n'));
+
+              if (!ok) core.setFailed('Restack had failures');
+              return;
+            }
+
+            // ── merge ──
+            if (command === 'merge') {
+              const merged = await tryMerge(prNumber, mergeMethod);
+              if (!merged.ok) {
+                await post(prNumber, `Merge failed: ${merged.error}`);
+                core.setFailed(merged.error);
+                return;
+              }
+
+              if (!children.length) {
+                await post(prNumber, `Merged into \`${baseBranch}\`.`);
+                return;
+              }
+
+              const results = await restackChildren(
+                children, baseBranch, pr.head.sha
+              );
+              const ok = results.every(r => r.status === 'restacked');
+
+              await post(prNumber, [
+                ok
+                  ? '### Merged + Restacked'
+                  : '### Merged (restack needs attention)',
+                '',
+                `#${prNumber} merged into \`${baseBranch}\`.`,
+                '',
+                formatResults(results, baseBranch, pr.head.sha),
+              ].join('\n'));
+
+              for (const r of results) {
+                await post(r.pr, [
+                  `#${prNumber} (\`${pr.head.ref}\`) was merged.`,
+                  r.status === 'restacked'
+                    ? 'Your branch was automatically restacked.'
+                    : `Restack status: **${r.status}**`,
+                ].join(' ')).catch(() => {});
+              }
+
+              if (!ok) core.setFailed('Restack had failures');
+              return;
+            }
+
+            // ── merge-all ──
+            if (command === 'merge-all') {
+              if (!force) {
+                const allPRs = [prNumber, ...children.map(c => c.pr)];
+                const unapproved = [];
+                for (const n of allPRs) {
+                  if (!(await isApproved(n))) unapproved.push(n);
+                }
+                if (unapproved.length) {
+                  await post(prNumber, [
+                    '### Cannot merge-all',
+                    '',
+                    `Not approved: ${unapproved.map(n => `#${n}`).join(', ')}`,
+                    '',
+                    'Use `stack merge-all --force` to skip approval check.',
+                  ].join('\n'));
+                  core.setFailed('Not all PRs approved');
+                  return;
+                }
+              }
+
+              const first = await tryMerge(prNumber, mergeMethod);
+              if (!first.ok) {
+                await post(
+                  prNumber,
+                  `Merge failed for #${prNumber}: ${first.error}`
+                );
+                core.setFailed(first.error);
+                return;
+              }
+
+              if (!children.length) {
+                await post(
+                  prNumber,
+                  `Merged into \`${baseBranch}\`. (no children)`
+                );
+                return;
+              }
+
+              const results = [];
+              let prevSkip = pr.head.sha;
+
+              for (let i = 0; i < children.length; i++) {
+                const child = children[i];
+                await exec.exec('git', ['fetch', 'origin']);
+
+                const oldTip = await getOldTip(child.branch);
+                if (!oldTip) {
+                  results.push({ ...child, status: 'missing' });
+                  for (let j = i + 1; j < children.length; j++) {
+                    results.push({ ...children[j], status: 'skipped' });
+                  }
+                  break;
+                }
+
+                await ensureLocalBranch(child.branch);
+
+                const rs = await doRestack(
+                  child.branch, `origin/${baseBranch}`, prevSkip
+                );
+                if (!rs.ok) {
+                  results.push({
+                    ...child, status: 'conflict', oldTip, error: rs.error,
+                  });
+                  for (let j = i + 1; j < children.length; j++) {
+                    results.push({ ...children[j], status: 'skipped' });
+                  }
+                  break;
+                }
+
+                await github.rest.pulls
+                  .update({
+                    owner, repo, pull_number: child.pr, base: baseBranch,
+                  })
+                  .catch(() => {});
+
+                console.log(
+                  `Waiting for CI on #${child.pr} (${child.branch})...`
+                );
+                const merged = await tryMerge(child.pr, mergeMethod, 20);
+
+                if (!merged.ok) {
+                  results.push({
+                    ...child,
+                    status: 'merge_failed',
+                    oldTip,
+                    error: merged.error,
+                  });
+                  for (let j = i + 1; j < children.length; j++) {
+                    results.push({ ...children[j], status: 'skipped' });
+                  }
+                  break;
+                }
+
+                results.push({ ...child, status: 'merged', oldTip });
+                prevSkip = oldTip;
+              }
+
+              const allMerged = results.every(r => r.status === 'merged');
+              const mergedCount =
+                results.filter(r => r.status === 'merged').length + 1;
+              const total = children.length + 1;
+
+              const rows = results.map(r => {
+                const st = {
+                  merged: 'Merged',
+                  conflict: 'Conflict',
+                  merge_failed: `Merge failed: ${r.error || ''}`,
+                  missing: 'Branch not found',
+                  skipped: 'Skipped',
+                }[r.status] || r.status;
+                return `| \`${r.branch}\` | #${r.pr} | ${st} |`;
+              });
+
+              await post(prNumber, [
+                allMerged
+                  ? `### Stack Merged (${mergedCount}/${total})`
+                  : `### Stack Merge: Stopped (${mergedCount}/${total} merged)`,
+                '',
+                '| Branch | PR | Status |',
+                '|--------|-----|--------|',
+                `| \`${pr.head.ref}\` | #${prNumber} | Merged |`,
+                ...rows,
+                '',
+                !allMerged
+                  ? 'Fix the issue and run `stack merge` on the failed PR.'
+                  : '',
+              ].join('\n'));
+
+              if (!allMerged) core.setFailed('Not all PRs merged');
+              return;
+            }
+
+      - name: Result reaction
+        if: always() && steps.cmd.outputs.valid == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.reactions.createForIssueComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              comment_id: context.payload.comment.id,
+              content:
+                '${{ steps.run.outcome }}' === 'success'
+                  ? 'rocket'
+                  : 'confused',
+            });
