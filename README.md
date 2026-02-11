@@ -85,6 +85,26 @@ jobs:
           token: ${{ secrets.STACK_BOT_TOKEN }}
 ```
 
+### With custom runners
+
+Staqd is a composite action — `runs-on` is controlled by your workflow, not the action. Use any runner you need:
+
+```yaml
+jobs:
+  guide:
+    runs-on: self-hosted
+    steps:
+      - uses: siner308/staqd@v1
+
+  resolve-base:
+    runs-on: [self-hosted, linux, arm64]
+    # ...
+
+  command:
+    runs-on: ubuntu-latest-4-cores
+    # ...
+```
+
 ### Inputs
 
 | Input | Description | Required | Default |
