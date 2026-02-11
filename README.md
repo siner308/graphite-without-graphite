@@ -1,4 +1,3 @@
-[![CI](https://github.com/siner308/staqd/actions/workflows/dogfood.yml/badge.svg)](https://github.com/siner308/staqd/actions/workflows/dogfood.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![GitHub release](https://img.shields.io/github/v/release/siner308/staqd?include_prereleases&sort=semver)](https://github.com/siner308/staqd/releases)
 
