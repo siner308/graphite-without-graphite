@@ -169,6 +169,7 @@ Comment on a PR to trigger:
 | `stack merge-all` (`st merge-all`) | Merge the entire stack in order (all PRs must be approved) |
 | `stack merge-all --force` (`st merge-all --force`) | Merge the entire stack (skip approval check) |
 | `stack restack` (`st restack`) | Rebase child branches without merging |
+| `stack discover` (`st discover`) | Auto-discover stack tree from base branches and update metadata |
 | `stack help` (`st help`) | Show usage |
 
 > **Tip:** All commands support the short alias `st` — e.g., `st merge` instead of `stack merge`.
@@ -199,7 +200,34 @@ gh pr create --base feat-auth  --head feat-auth-ui    --title "feat: add auth UI
 gh pr create --base feat-auth-ui --head feat-auth-tests --title "test: add auth tests"  # → PR #3
 ```
 
-### 3. Add stack metadata to parent PR bodies
+### 3. Add stack metadata
+
+**Option A: Auto-discover (recommended)**
+
+Comment on the root PR:
+
+```
+st discover
+```
+
+Staqd scans all open PRs by base branch relationships, builds the tree, and updates every PR's metadata automatically. It also detects if any children need restacking:
+
+```
+### Stack Discovered
+
+Found 3 PR(s) in the stack:
+
+- #1 (feat-auth) → #2
+  - #2 (feat-auth-ui) → #3 ⚠️
+    - #3 (feat-auth-tests)
+
+All PR metadata has been updated.
+
+> ⚠️ Some PRs are out of date with their parent branch.
+> Run `st restack` on the parent PR to rebase.
+```
+
+**Option B: Manual metadata**
 
 Each parent PR's body needs an HTML comment listing its direct children:
 
