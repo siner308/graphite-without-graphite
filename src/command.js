@@ -503,14 +503,16 @@ module.exports = async function command({ github, context, core, exec, command, 
 
     // Recursively merge children → grandchildren in DFS order
     const results = [];
+    let mergeOrder = 1; // #1 (root) is order 1
 
     async function mergeChildren(childrenList, parentSkipSha) {
       for (const child of childrenList) {
         await exec.exec('git', ['fetch', 'origin']);
 
+        const order = ++mergeOrder;
         const oldTip = await getOldTip(child.branch);
         if (!oldTip) {
-          results.push({ ...child, status: 'missing' });
+          results.push({ ...child, status: 'missing', order });
           continue;
         }
 
@@ -521,7 +523,7 @@ module.exports = async function command({ github, context, core, exec, command, 
         );
         if (!rs.ok) {
           results.push({
-            ...child, status: 'conflict', oldTip, error: rs.error,
+            ...child, status: 'conflict', oldTip, error: rs.error, order,
           });
           continue;
         }
@@ -543,11 +545,12 @@ module.exports = async function command({ github, context, core, exec, command, 
             status: 'merge_failed',
             oldTip,
             error: merged.error,
+            order,
           });
           continue;
         }
 
-        results.push({ ...child, status: 'merged', oldTip });
+        results.push({ ...child, status: 'merged', oldTip, order });
         await deleteBranch(child.branch);
 
         // Recursively process this child's children
@@ -573,21 +576,26 @@ module.exports = async function command({ github, context, core, exec, command, 
         missing: 'Branch not found',
         skipped: 'Skipped',
       }[r.status] || r.status;
-      return `| \`${r.branch}\` | #${r.pr} | ${st} |`;
+      return `| ${r.order} | \`${r.branch}\` | #${r.pr} | ${st} |`;
     });
+
+    const failedPRs = results
+      .filter(r => !['merged'].includes(r.status))
+      .sort((a, b) => a.order - b.order)
+      .map(r => `#${r.pr}`);
 
     await post(prNumber, [
       allMerged
         ? `### Stack Merged (${mergedCount}/${total})`
         : `### Stack Merge: Stopped (${mergedCount}/${total} merged)`,
       '',
-      '| Branch | PR | Status |',
-      '|--------|-----|--------|',
-      `| \`${pr.head.ref}\` | #${prNumber} | Merged |`,
+      '| Order | Branch | PR | Status |',
+      '|-------|--------|-----|--------|',
+      `| 1 | \`${pr.head.ref}\` | #${prNumber} | Merged |`,
       ...rows,
       '',
       !allMerged
-        ? 'Fix the issue and run `stack merge` on the failed PR.'
+        ? `Fix the issue and run \`st merge\` in order: ${failedPRs.join(' → ')}`
         : '',
     ].join('\n'));
 
