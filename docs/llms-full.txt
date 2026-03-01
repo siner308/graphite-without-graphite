@@ -61,7 +61,7 @@ Comment on a PR to trigger:
 
 - `stack merge` (`st merge`) — Merge this PR, restack child branches, and delete the merged branch
 - `stack merge-all` (`st merge-all`) — Merge the entire stack in order, deleting each branch after merge (all PRs must be approved)
-- `stack merge-all --force` (`st merge-all --force`) — Merge the entire stack (skip approval check)
+- `stack merge-all --force` (`st merge-all --force`) — Same as `merge-all` but skips the approval check
 - `stack restack` (`st restack`) — Rebase child branches without merging
 - `stack discover` (`st discover`) — Auto-discover stack tree from base branches and update metadata
 - `stack help` (`st help`) — Show usage
@@ -95,7 +95,7 @@ Merge the entire stack in DFS order. Each PR is rebased, merged, its branch dele
 
 - When to use: When the entire stack is reviewed and approved — merge everything at once.
 - What it does: Checks approval status on all PRs, then sequentially rebases and merges each one, deleting each branch after merge. Retries up to 10 min per PR for CI to pass. The result table includes merge order — if a conflict occurs, the failure message shows which PRs to fix and in what order.
-- Options: Add `--force` to skip the approval check (e.g., `st merge-all --force`).
+- Options: Add `--force` to skip the approval check — otherwise identical behavior (e.g., `st merge-all --force`).
 
 ### stack help
 
