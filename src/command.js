@@ -52,6 +52,16 @@ module.exports = async function command({ github, context, core, exec, command, 
     );
   }
 
+  async function deleteBranch(branch) {
+    try {
+      await github.rest.git.deleteRef({
+        owner, repo, ref: `heads/${branch}`,
+      });
+    } catch (e) {
+      console.log(`Could not delete branch ${branch}: ${e.message}`);
+    }
+  }
+
   async function tryMerge(prNum, method = 'squash', retries = 0) {
     for (let i = 0; i <= retries; i++) {
       try {
@@ -320,13 +330,8 @@ module.exports = async function command({ github, context, core, exec, command, 
 
     const lines = tree.map(node => {
       const indent = '  '.repeat(node.depth);
-      const childInfo = node.children.length
-        ? ` → ${node.children.map(c => {
-            const warn = c.needsRestack ? ' ⚠️' : '';
-            return `#${c.pr}${warn}`;
-          }).join(', ')}`
-        : '';
-      return `${indent}- #${node.pr} (\`${node.branch}\`)${childInfo}`;
+      const warn = node.needsRestack ? ' ⚠️' : '';
+      return `${indent}- #${node.pr} (\`${node.branch}\`)${warn}`;
     });
 
     await post(prNumber, [
@@ -408,6 +413,8 @@ module.exports = async function command({ github, context, core, exec, command, 
       return;
     }
 
+    await deleteBranch(pr.head.ref);
+
     if (!children.length) {
       await post(prNumber, `Merged into \`${baseBranch}\`.`);
       return;
@@ -484,6 +491,8 @@ module.exports = async function command({ github, context, core, exec, command, 
       return;
     }
 
+    await deleteBranch(pr.head.ref);
+
     if (!children.length) {
       await post(
         prNumber,
@@ -539,6 +548,7 @@ module.exports = async function command({ github, context, core, exec, command, 
         }
 
         results.push({ ...child, status: 'merged', oldTip });
+        await deleteBranch(child.branch);
 
         // Recursively process this child's children
         const { meta: childMeta } = await getStackMeta(child.pr);
